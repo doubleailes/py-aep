@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import io
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING
@@ -157,10 +157,27 @@ class Stream:
 
 
 class CosParser:
+    """Recursive-descent parser for the COS syntax of text documents and PDF
+    objects.
+
+    The lexer works on the data in memory: the bytes left in `file` (up to
+    `max_pos` of them) are read once, and tokens are scanned with regular
+    expressions rather than one `read(1)` per byte.
+    """
+
     def __init__(self, file: BinaryIO, max_pos: int | None = None) -> None:
         self.file = file
-        self.max_pos = max_pos
+        data = file.read() if max_pos is None else file.read(max(max_pos, 0))
+        self._data: bytes = bytes(data)
+        self._pos = 0
+        self._end = len(self._data)
+        self._limited = max_pos is not None
         self.lookahead: Token = Token(TokenType.Eof)  # Will be set by lex()
+
+    @property
+    def max_pos(self) -> int | None:
+        """Bytes left to read, or `None` when the data was not limited."""
+        return self._end - self._pos if self._limited else None
 
     def parse(self) -> dict[str, Any] | list[Any] | Any:
         self.lex()
@@ -229,12 +246,11 @@ class CosParser:
 
         raise SyntaxError(f"Expected COS value, got {self.lookahead}")
 
-    def save_state(self) -> tuple[int | None, int, Token]:
-        return (self.max_pos, self.file.tell(), self.lookahead)
+    def save_state(self) -> tuple[int, Token]:
+        return (self._pos, self.lookahead)
 
-    def restore_state(self, state: tuple[int | None, int, Token]) -> None:
-        self.max_pos, pos, self.lookahead = state
-        self.file.seek(pos)
+    def restore_state(self, state: tuple[int, Token]) -> None:
+        self._pos, self.lookahead = state
 
     def parse_dict_content(self) -> dict[str, Any]:
         value = {}
@@ -272,21 +288,34 @@ class CosParser:
         self.lookahead = self.lex_token()
 
     def lex_token(self) -> Token:
-        char: bytes | None = None
-        while True:
-            char = self.get_char()
-            if char is None:
-                return Token(TokenType.Eof)
-            elif char == b"%":
-                self.lex_comment()
-            elif not char.isspace():
-                break
-
-        # At this point char is guaranteed to be bytes (not None)
-        assert char is not None
+        data = self._data
+        end = self._end
+        # One match skips whitespace and comments and reads the common
+        # tokens whole; anything else (strings, hex strings, `#` escapes,
+        # malformed input) goes on from `pos` byte by byte below.
+        match = _TOKEN_RE.match(data, self._pos, end)
+        assert match is not None
+        kind = match.lastindex
+        if kind != _OTHER:
+            self._pos = match.end()
+            if kind == _IDENTIFIER:
+                return Token(TokenType.Identifier, match.group(kind).decode("latin-1"))
+            if kind == _INTEGER:
+                return Token(TokenType.Number, int(match.group(kind)))
+            if kind == _FLOAT:
+                return Token(TokenType.Number, float(match.group(kind)))
+            if kind == _KEYWORD:
+                return self._keyword_token(match.group(kind))
+            return _PUNCTUATION_TOKENS[kind]
+        pos = match.end()
+        if pos >= end:
+            self._pos = end
+            return Token(TokenType.Eof)
+        c = data[pos]
+        self._pos = pos + 1
 
         # <<
-        if char == b"<":
+        if c == 0x3C:  # <
             next_char = self.get_char()
             if next_char == b"<":
                 return Token(TokenType.ObjectStart)
@@ -298,26 +327,25 @@ class CosParser:
                 self.raise_lex(b"<" + next_char)
 
         # >>
-        if char == b">":
-            self.expect_char(b">", char)
+        if c == 0x3E:  # >
+            self.expect_char(b">", b">")
             return Token(TokenType.ObjectEnd)
 
-        # [
-        if char == b"[":
+        if c == 0x5B:  # [
             return Token(TokenType.ArrayStart)
 
-        # ]
-        if char == b"]":
+        if c == 0x5D:  # ]
             return Token(TokenType.ArrayEnd)
 
         # /foo
-        if char == b"/":
+        if c == 0x2F:  # /
             return self.lex_identifier()
 
         # (foo)
-        if char == b"(":
+        if c == 0x28:  # (
             return self.lex_string()
 
+        char = data[pos : pos + 1]
         # Keyword
         if char.isalpha():
             return self.lex_keyword(char)
@@ -340,19 +368,15 @@ class CosParser:
         raise SyntaxError(msg)
 
     def get_char(self) -> bytes | None:
-        if self.max_pos is not None:
-            if self.max_pos <= 0:
-                return None
-            self.max_pos -= 1
-        # `read(1)` gives `b""` at the end of the data. Every lexer loop stops
-        # on `None`, so passing `b""` on spun them forever on a truncated
-        # document (an empty byte also matched `in b".+-"` as a number start).
-        return self.file.read(1) or None
+        """The next byte, or `None` at the end of the (limited) data."""
+        pos = self._pos
+        if pos >= self._end:
+            return None
+        self._pos = pos + 1
+        return self._data[pos : pos + 1]
 
     def unget(self) -> None:
-        self.file.seek(-1, io.SEEK_CUR)
-        if self.max_pos is not None:
-            self.max_pos += 1
+        self._pos -= 1
 
     # Skip until newline
     def lex_comment(self) -> None:
@@ -364,51 +388,29 @@ class CosParser:
                 break
 
     def lex_number(self, char: bytes) -> Token:
+        """A number whose first byte, `char`, was just read: digits with an
+        optional fraction, after an optional sign. A lone sign or dot raises
+        `ValueError`, as `int` / `float` do."""
         if char == b".":
-            return self.lex_num_fract(self.get_char(), char)
-        elif char == b"+" or char == b"-":
-            return self.lex_num_int(self.get_char(), char)
-        else:
-            return self.lex_num_int(char, b"")
-
-    def lex_num_int(self, char: bytes | None, head: bytes) -> Token:
-        while True:
-            if char is None:
-                break
-            elif char == b".":
-                return self.lex_num_fract(self.get_char(), head + char)
-            elif char.isdigit():
-                head += char
-                char = self.get_char()
-            else:
-                self.unget()
-                break
-        return Token(TokenType.Number, int(head))
-
-    def lex_num_fract(self, char: bytes | None, head: bytes) -> Token:
-        while True:
-            if char is None:
-                break
-            elif char.isdigit():
-                head += char
-                char = self.get_char()
-            else:
-                self.unget()
-                break
-        return Token(TokenType.Number, float(head))
+            match = _DIGITS_RE.match(self._data, self._pos, self._end)
+            assert match is not None
+            self._pos = match.end()
+            return Token(TokenType.Number, float(char + match.group()))
+        match = _NUMBER_REST_RE.match(self._data, self._pos, self._end)
+        assert match is not None
+        self._pos = match.end()
+        rest = match.group()
+        if b"." in rest:
+            return Token(TokenType.Number, float(char + rest))
+        return Token(TokenType.Number, int(char + rest))
 
     def lex_keyword(self, char: bytes) -> Token:
-        kw = char
-        while True:
-            next_char = self.get_char()
-            if next_char is None:
-                break
-            elif next_char.isalpha():
-                kw += next_char
-            else:
-                self.unget()
-                break
+        match = _ALPHA_RE.match(self._data, self._pos, self._end)
+        assert match is not None
+        self._pos = match.end()
+        return self._keyword_token(char + match.group())
 
+    def _keyword_token(self, kw: bytes) -> Token:
         if kw == b"true":
             return Token(TokenType.Boolean, True)
         elif kw == b"false":
@@ -436,36 +438,37 @@ class CosParser:
         elif char != b"\n":
             raise SyntaxError("Expected newline after `stream`")
 
-        # Read in blocks up to the first `endstream`: a byte at a time (with a
-        # growing bytes object) took seconds for a 0.5 MB embedded ICC profile.
-        marker = b"endstream"
-        stream = bytearray()
-        while True:
-            size = 65536 if self.max_pos is None else min(65536, self.max_pos)
-            block = self.file.read(size) if size > 0 else b""
-            if not block:
-                raise SyntaxError("Unterminated stream")
-            if self.max_pos is not None:
-                self.max_pos -= len(block)
-            search_from = max(0, len(stream) - len(marker) + 1)
-            stream += block
-            end = stream.find(marker, search_from)
-            if end >= 0:
-                # Give back what was read past the marker.
-                extra = len(stream) - end - len(marker)
-                self.file.seek(-extra, io.SEEK_CUR)
-                if self.max_pos is not None:
-                    self.max_pos += extra
-                return Token(TokenType.Stream, bytes(stream[:end]))
+        # The data runs up to the first `endstream`.
+        start = self._pos
+        end = self._data.find(b"endstream", start, self._end)
+        if end < 0:
+            self._pos = self._end
+            raise SyntaxError("Unterminated stream")
+        self._pos = end + len(b"endstream")
+        return Token(TokenType.Stream, self._data[start:end])
 
     def lex_string(self) -> Token:
-        # Read the entire string content first
-        string = b""
+        # Read the entire string content first: the runs between escapes are
+        # sliced whole, up to the first unescaped `)`.
+        data = self._data
+        end = self._end
+        pos = self._pos
+        parts: list[bytes] = []
         while True:
-            char = self.lex_string_char()
-            if char is None:
+            close = data.find(b")", pos, end)
+            backslash = data.find(b"\\", pos, end if close < 0 else close)
+            if backslash < 0:
+                if close < 0:
+                    self._pos = end
+                    raise SyntaxError("Unterminated string")
+                parts.append(data[pos:close])
+                self._pos = close + 1
                 break
-            string += char
+            parts.append(data[pos:backslash])
+            self._pos = backslash + 1
+            parts.append(self.lex_string_escape())
+            pos = self._pos
+        string = b"".join(parts)
 
         # Default to UTF-8 encoding
         encoding = "utf-8"
@@ -575,27 +578,56 @@ class CosParser:
         return Token(TokenType.HexString, data)
 
     def lex_identifier(self) -> Token:
-        ident = ""
-        special = b"()[]<>{}/%"
-        while True:
-            char = self.get_char()
-            if char is None:
-                break
-            elif char < b"!" or char > b"~":
-                self.unget()
-                break
-            elif char == b"#":
-                hexstr = b""
-                for _ in range(2):
-                    char = self.get_char()
-                    if char is None or not self.is_hex(char):
-                        raise SyntaxError("Invalid identifier")
-                    hexstr += char
-                ident += chr(int(hexstr, 16))
-            elif char in special:
-                self.unget()
-                break
-            else:
-                ident += chr(char[0])
+        # Printable ASCII up to a delimiter or whitespace; `#xx` is the byte
+        # with that hex code. A `#` the match stops at lacks its two digits.
+        match = _IDENT_RE.match(self._data, self._pos, self._end)
+        assert match is not None
+        self._pos = match.end()
+        if self._pos < self._end and self._data[self._pos] == 0x23:  # #
+            raise SyntaxError("Invalid identifier")
+        raw = match.group()
+        if b"#" in raw:
+            raw = _HEX_ESCAPE_RE.sub(lambda m: bytes([int(m.group(1), 16)]), raw)
+        return Token(TokenType.Identifier, raw.decode("latin-1"))
 
-        return Token(TokenType.Identifier, ident)
+
+_TOKEN_RE = re.compile(
+    rb"""
+    (?:[ \t\n\r\x0b\x0c]+|%[^\n]*\n?)*        # whitespace and comments
+    (?:
+        (<<)                                    # 1
+      | (>>)                                    # 2
+      | (\[)                                    # 3
+      | (\])                                    # 4
+      | /([^\x00-\x20\x7f-\xff()\[\]<>{}/%\#]*)       # 5 name, no escapes,
+        (?![^\x00-\x20\x7f-\xff()\[\]<>{}/%])         #   whole (no backtracking)
+      | ([+-]?[0-9]+)(?![.0-9])                 # 6 integer
+      | ([+-]?[0-9]*\.[0-9]*)                    # 7 real (a lone "." raises)
+      | ([A-Za-z]+)                             # 8 keyword
+      | ()                                      # 9 anything else
+    )
+    """,
+    re.VERBOSE,
+)
+"""The tokens `CosParser.lex_token` reads in one match, after the
+whitespace and `%` comments before them; group 9 matches the empty string
+before any other token, which is then lexed byte by byte."""
+
+_IDENTIFIER, _INTEGER, _FLOAT, _KEYWORD, _OTHER = 5, 6, 7, 8, 9
+
+_PUNCTUATION_TOKENS = {
+    1: Token(TokenType.ObjectStart),
+    2: Token(TokenType.ObjectEnd),
+    3: Token(TokenType.ArrayStart),
+    4: Token(TokenType.ArrayEnd),
+}
+"""Shared tokens for value-less punctuation (tokens are never mutated)."""
+
+_SKIP_RE = re.compile(rb"(?:[ \t\n\r\x0b\x0c]+|%[^\n]*\n?)*")
+"""Whitespace (as `bytes.isspace` has it) and `%` comments."""
+
+_DIGITS_RE = re.compile(rb"[0-9]*")
+_NUMBER_REST_RE = re.compile(rb"[0-9]*(?:\.[0-9]*)?")
+_ALPHA_RE = re.compile(rb"[A-Za-z]*")
+_IDENT_RE = re.compile(rb"(?:[^\x00-\x20\x7f-\xff()\[\]<>{}/%#]+|#[0-9A-Fa-f]{2})*")
+_HEX_ESCAPE_RE = re.compile(rb"#([0-9A-Fa-f]{2})")

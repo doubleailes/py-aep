@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from py_aep.enums import AutoOrientType, Label, LayerType
 
+from ..._gc import gc_paused
 from ...ae_version import ae_writes
 from ...binary.chunk import ListChunk
 from ...binary.composition_chunks import layer_timebase, rescale_ticks
@@ -424,7 +425,8 @@ class Layer(PropertyGroup):
         self._tree_param_defs = None
         self._properties = []
         try:
-            self._build_property_tree(effect_param_defs)
+            with gc_paused():
+                self._build_property_tree(effect_param_defs)
         except BaseException:
             # Unbuilt again, so the next read raises too rather than seeing
             # a partial tree.

@@ -4,6 +4,7 @@ import re
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast
 
+from py_aep._gc import gc_paused
 from py_aep.data.builtin_effects import BUILTIN_EFFECTS
 from py_aep.data.effect_controls import EXPRESSION_CONTROLS
 from py_aep.data.match_names import MATCH_NAME_TO_AUTO_NAME
@@ -581,7 +582,8 @@ class PropertyGroup(PropertyBase):
         if ae_major is None:
             return
         self._deferred_ae_major = None
-        self._run_deferred_synthesis(ae_major)
+        with gc_paused():
+            self._run_deferred_synthesis(ae_major)
 
     def _run_deferred_synthesis(self, ae_major: int) -> None:
         """Perform full child synthesis for this group.

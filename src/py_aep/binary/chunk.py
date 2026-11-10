@@ -10,15 +10,17 @@ import struct
 import sys
 from contextvars import ContextVar
 from io import BytesIO
+from operator import attrgetter
 from typing import TYPE_CHECKING, cast
 
 from attrs import Factory, define, field
+from attrs import fields as _attrs_fields
 
+from .._gc import gc_paused
 from .bin_utils import (
     _HEADER_STRUCT,
     read_bytes,
     read_fmt,
-    read_pad,
     write_bytes,
     write_fmt,
     write_pad,
@@ -62,11 +64,32 @@ class Chunk:
         chunk_type: str = "",
         **kwargs: Any,
     ) -> Chunk:
-        # Get fields
-        info = _struct_info(cls)
-        if info is None:
-            data = read_bytes(fp, size)
+        plan = _PLANS.get(cls) or _codec_plan(cls)
+        if plan.raw:
+            data = fp.read(size)
+            if len(data) < size:
+                raise OSError(f"Short read: expected {size} bytes, got {len(data)}")
             return cls(chunk_type=chunk_type, data=data)
+        expected = plan.expected
+        if plan.simple and size >= expected:
+            # Fast path: no string encodings, endian overrides, optional
+            # fields, or items. dict(zip()) replaces the _decode_fields
+            # Python loop. Coerces (e.g. bool_field) are handled inline.
+            raw = fp.read(expected)
+            if len(raw) < expected:
+                raise OSError(f"Short read: expected {expected} bytes, got {len(raw)}")
+            kw: dict[str, Any] = dict(zip(plan.init_names, plan.struct.unpack(raw)))
+            kw["chunk_type"] = chunk_type
+            for name, crc in plan.read_coerces:
+                kw[name] = crc(kw[name])
+            trailing_size = size - expected
+            if trailing_size > 0:
+                extra = read_bytes(fp, trailing_size)
+                instance = cls(**kw)
+                object.__setattr__(instance, "_trailing", extra)
+                return instance
+            return cls(**kw)
+
         (
             fmt,
             data_fields,
@@ -76,27 +99,10 @@ class Chunk:
             items_info,
             coerces,
             init_names,
-            simple,
+            _simple,
             expected,
-        ) = info
+        ) = plan.info
         mixed_endian = bool(endians)
-
-        if simple and size >= expected:
-            # Fast path: no string encodings, endian overrides, optional
-            # fields, or items. dict(zip()) replaces the _decode_fields
-            # Python loop. Coerces (e.g. bool_field) are handled inline.
-            kw: dict[str, Any] = dict(zip(init_names, read_fmt(fmt, fp)))
-            kw["chunk_type"] = chunk_type
-            for i, crc in coerces.items():
-                name = init_names[i]
-                kw[name] = crc(kw[name])
-            trailing_size = size - expected
-            if trailing_size > 0:
-                extra = read_bytes(fp, trailing_size)
-                instance = cls(**kw)
-                object.__setattr__(instance, "_trailing", extra)
-                return instance
-            return cls(**kw)
 
         if mixed_endian:
             # Per-field read: each field may have its own endian prefix
@@ -170,9 +176,43 @@ class Chunk:
         return instance
 
     def write(self, fp: IO[bytes]) -> int:
-        info = _struct_info(type(self))
-        if info is None:
-            return write_bytes(fp, self.data)
+        plan = _PLANS.get(type(self)) or _codec_plan(type(self))
+        if plan.raw or plan.packer is not None:
+            # `_encode_body` may be overridden (string and value chunks).
+            return write_bytes(fp, self._encode_body())
+        return self._write_general(fp, plan.info)
+
+    def _encode_body(self) -> bytes:
+        """The serialized body, built without a file object.
+
+        `write_chunk` writes a chunk whose class keeps `Chunk.write` from
+        this in one go (no length backpatching). A subclass that overrides
+        `write` alone keeps working: `write_chunk` then calls its `write`.
+        """
+        plan = _PLANS.get(type(self)) or _codec_plan(type(self))
+        if plan.raw:
+            return self.data
+        packer = plan.packer
+        if packer is None:
+            with BytesIO() as f:
+                self._write_general(f, plan.info)
+                return f.getvalue()
+        values = plan.getter(self) if plan.getter is not None else ()
+        if plan.single:
+            values = (values,)
+        if plan.int_indices:
+            values = list(values)
+            for i in plan.int_indices:
+                values[i] = int(values[i])
+        body = packer(*values) if plan.has_fmt else b""
+        items_attr = plan.items_attr
+        if items_attr is not None:
+            body += b"".join([item.tobytes() for item in getattr(self, items_attr)])
+        trailing = self._trailing
+        return body + trailing if trailing else body
+
+    def _write_general(self, fp: IO[bytes], info: Any) -> int:
+        """`write` for layouts with optional, string or mixed-endian fields."""
         (
             fmt,
             data_fields,
@@ -244,6 +284,158 @@ class Chunk:
             return f.getvalue()
 
 
+_EMPTY_STRUCT = struct.Struct(">")
+
+
+class _CodecPlan:
+    """Per-class read/write plan derived from `_struct_info`, cached in
+    `_PLANS` so the per-chunk hot path does no format-string work."""
+
+    __slots__ = (
+        "info",
+        "raw",
+        "simple",
+        "expected",
+        "struct",
+        "init_names",
+        "read_coerces",
+        "packer",
+        "has_fmt",
+        "getter",
+        "single",
+        "int_indices",
+        "items_attr",
+    )
+
+    def __init__(self, cls: type) -> None:
+        info = _struct_info(cls)
+        # `_struct_info`'s tuple; only read when `raw` is false.
+        self.info: Any = info
+        self.raw = info is None
+        self.packer: Callable[..., bytes] | None = None
+        self.getter: Callable[[Any], Any] | None = None
+        self.single = False
+        self.int_indices: tuple[int, ...] = ()
+        self.items_attr: str | None = None
+        self.has_fmt = False
+        if info is None:
+            self.simple = False
+            self.expected = 0
+            self.struct = _EMPTY_STRUCT
+            self.init_names: tuple[str, ...] = ()
+            self.read_coerces: tuple[tuple[str, Any], ...] = ()
+            return
+        (
+            fmt,
+            data_fields,
+            encodings,
+            optional_start,
+            endians,
+            items_info,
+            coerces,
+            init_names,
+            simple,
+            expected,
+        ) = info
+        self.simple = simple
+        self.expected = expected
+        self.struct = struct.Struct(">" + fmt)
+        self.init_names = init_names
+        self.read_coerces = tuple((init_names[i], c) for i, c in coerces.items())
+        # Fixed layouts (no optional, string or mixed-endian fields) are
+        # packed straight from their attributes.
+        if not encodings and not endians and optional_start == len(data_fields):
+            names = [f.name for f in data_fields]
+            self.has_fmt = bool(fmt)
+            self.packer = self.struct.pack
+            if names:
+                self.getter = attrgetter(*names)
+                self.single = len(names) == 1
+            self.int_indices = tuple(sorted(coerces))
+            if items_info is not None:
+                # attrs stores the field under its own (possibly private)
+                # name; `items_info` holds the init name.
+                items_field = next(
+                    f.name for f in _attrs_fields(cls) if f.metadata.get("items")
+                )
+                self.items_attr = items_field
+
+
+_PLANS: dict[type, _CodecPlan] = {}
+
+
+def _make_fast_reader(cls: type) -> Callable[..., Any] | None:
+    """A reader for `read_chunks` that skips `Chunk.read`'s dispatch, for a
+    class that keeps `Chunk.read` and has a raw or simple fixed layout.
+
+    It is called as `reader(read, size, chunk_type)`, `read` being the
+    file's bound `read`, and reads exactly as `Chunk.read` would. Any other
+    class gets `None` here and goes through `cls.read`.
+    """
+    if not issubclass(cls, Chunk) or cls._nests:
+        return None
+    if cls.read.__func__ is not Chunk.read.__func__:  # type: ignore[attr-defined]
+        return None
+    plan = _codec_plan(cls)
+    if plan.raw:
+
+        def read_raw(read: Callable[[int], bytes], size: int, chunk_type: str) -> Any:
+            data = read(size)
+            if len(data) < size:
+                raise OSError(f"Short read: expected {size} bytes, got {len(data)}")
+            return cls(chunk_type=chunk_type, data=data)
+
+        return read_raw
+    if not plan.simple:
+        return None
+    expected = plan.expected
+    unpack = plan.struct.unpack
+    init_names = plan.init_names
+    read_coerces = plan.read_coerces
+
+    def read_simple(read: Callable[[int], bytes], size: int, chunk_type: str) -> Any:
+        if size < expected:
+            # As `Chunk.read`: a simple layout has no optional fields.
+            raise OSError(
+                f"{chunk_type} body too short: expected >= {expected} bytes, got {size}"
+            )
+        raw = read(expected)
+        if len(raw) < expected:
+            raise OSError(f"Short read: expected {expected} bytes, got {len(raw)}")
+        kw: dict[str, Any] = dict(zip(init_names, unpack(raw)))
+        kw["chunk_type"] = chunk_type
+        for name, crc in read_coerces:
+            kw[name] = crc(kw[name])
+        if size > expected:
+            extra = read(size - expected)
+            if len(extra) < size - expected:
+                raise OSError(
+                    f"Short read: expected {size - expected} bytes, got {len(extra)}"
+                )
+            instance = cls(**kw)
+            object.__setattr__(instance, "_trailing", extra)
+            return instance
+        return cls(**kw)
+
+    return read_simple
+
+
+_FAST_READERS: dict[type, Callable[..., Any] | None] = {}
+_UNSET: Any = object()
+
+
+def _fast_reader(cls: type) -> Callable[..., Any] | None:
+    reader = _FAST_READERS[cls] = _make_fast_reader(cls)
+    return reader
+
+
+def _codec_plan(cls: type) -> _CodecPlan:
+    plan = _PLANS.get(cls)
+    if plan is None:
+        plan = _PLANS[cls] = _CodecPlan(cls)
+    return plan
+
+
 @register("LIST", "RIFX")
 @define
 class ListChunk(Chunk):
@@ -278,7 +470,10 @@ class ListChunk(Chunk):
             raise OSError(f"{chunk_type} body too small: {size}")
         if ctx is None:
             ctx = EMPTY_CTX
-        list_type = sys.intern(read_fmt("4s", fp)[0].decode("ASCII"))
+        raw_type = fp.read(4)
+        if len(raw_type) < 4:
+            raise OSError(f"Short read: expected 4 bytes, got {len(raw_type)}")
+        list_type = _TYPE_NAMES.get(raw_type) or _type_name(raw_type)
         if list_type == "btdk":
             data = read_bytes(fp, size - 4)
             return cls(
@@ -287,11 +482,7 @@ class ListChunk(Chunk):
                 chunk_type=chunk_type,
             )
         parent_result = kwargs.get("parent_result")
-        child_ctx = ReadContext(
-            parent_list_type=list_type,
-            grandparent_list_type=ctx.parent_list_type,
-            parent_siblings=parent_result,
-        )
+        child_ctx = ReadContext(list_type, ctx.parent_list_type, parent_result)
         if defer_list_types and list_type in defer_list_types:
             raw_body = fp.read(size - 4)
             return DeferredListChunk(
@@ -382,14 +573,15 @@ class DeferredListChunk(ListChunk):
         if parsed is None:
             body = self._raw_body
             ctx = self._raw_ctx or EMPTY_CTX
-            parsed = read_chunks(
-                BytesIO(body),
-                len(body),
-                ctx=ctx,
-                defer_list_types=_deferred_children(
-                    self.list_type, ctx.grandparent_list_type
-                ),
-            )
+            with gc_paused():
+                parsed = read_chunks(
+                    BytesIO(body),
+                    len(body),
+                    ctx=ctx,
+                    defer_list_types=_deferred_children(
+                        self.list_type, ctx.grandparent_list_type
+                    ),
+                )
             object.__setattr__(self, "_parsed_chunks", parsed)
             object.__setattr__(self, "_raw_body", b"")
             object.__setattr__(self, "_raw_ctx", None)
@@ -560,25 +752,24 @@ def _tiles_as_chunks(fp: IO[bytes], size: int) -> bool:
     to an even size) must end exactly at the body's end. Checking only the
     first header is not enough: a legacy 48-byte `fnam` holding a 4-letter
     name (`Fill`, `Glow`) reads as a `Fill` chunk of length 0 followed by
-    NUL padding. The body is walked by seeking; `fp` is left where it was.
+    NUL padding. The body is read and walked in memory; `fp` is left where
+    it was.
     """
     start = fp.tell()
+    body = fp.read(size)
+    fp.seek(start)
+    available = len(body)
     pos = 0
-    try:
-        while pos < size:
-            if size - pos < 8:
-                return False
-            header = fp.read(8)
-            if len(header) < 8 or not all(0x20 <= b < 0x7F for b in header[:4]):
-                return False
-            length: int = struct.unpack(">I", header[4:8])[0]
-            pos += 8 + length + (length & 1)
-            if pos > size:
-                return False
-            fp.seek(start + pos)
-        return pos == size
-    finally:
-        fp.seek(start)
+    while pos < size:
+        if size - pos < 8 or pos + 8 > available:
+            return False
+        if not all(0x20 <= b < 0x7F for b in body[pos : pos + 4]):
+            return False
+        (length,) = _LEN_STRUCT.unpack_from(body, pos + 4)
+        pos += 8 + length + (length & 1)
+        if pos > size:
+            return False
+    return pos == size
 
 
 # ---------------------------------------------------------------------------
@@ -698,23 +889,56 @@ def _resolve_context(
 # ---------------------------------------------------------------------------
 
 
+_TYPE_NAMES: dict[bytes, str] = {}
+"""Raw 4-byte chunk type -> interned `str`, so each type decodes once."""
+
+_TYPE_BYTES: dict[str, bytes] = {}
+"""Chunk type `str` -> its encoded 4 bytes, the reverse of `_TYPE_NAMES`."""
+
+
+def _type_name(raw_type: bytes) -> str:
+    # Interned: one shared string per type instead of one per chunk.
+    name = _TYPE_NAMES[raw_type] = sys.intern(raw_type.decode("ASCII"))
+    return name
+
+
+def _type_bytes(chunk_type: str) -> bytes:
+    raw = _TYPE_BYTES[chunk_type] = chunk_type.encode("ASCII")
+    return raw
+
+
 def read_header(fp: IO[bytes]) -> tuple[str, int]:
     """Read the 8-byte chunk header: (chunk_type, len_body)."""
     data = fp.read(8)
     if len(data) < 8:
         raise OSError(f"Short read on chunk header: expected 8 bytes, got {len(data)}")
     raw_type, len_body = _HEADER_STRUCT.unpack(data)
-    # Interned: one shared string per type instead of one per chunk.
-    chunk_type = sys.intern(raw_type.decode("ASCII"))
+    chunk_type = _TYPE_NAMES.get(raw_type) or _type_name(raw_type)
     return chunk_type, len_body
+
+
+_LEN_STRUCT = struct.Struct(">I")
+_BASE_WRITE = Chunk.write
 
 
 def write_chunk(fp: IO[bytes], chunk: Chunk) -> int:
     """Write a complete chunk: header + body + pad byte.
 
-    Backpatches len_body after the body is written.
+    A chunk whose class keeps `Chunk.write` is serialized first and written
+    in one go; any other is written in place and its len_body backpatched.
     """
-    written = write_bytes(fp, chunk.chunk_type.encode("ASCII"))
+    chunk_type = chunk.chunk_type
+    type_bytes = _TYPE_BYTES.get(chunk_type) or _type_bytes(chunk_type)
+    if type(chunk).write is _BASE_WRITE:
+        body = chunk._encode_body()
+        body_size = len(body)
+        fp.write(type_bytes + _LEN_STRUCT.pack(body_size))
+        fp.write(body)
+        if body_size & 1:
+            fp.write(b"\x00")
+            return body_size + 9
+        return body_size + 8
+    written = write_bytes(fp, type_bytes)
     len_pos = fp.tell()
     fp.seek(4, 1)  # skip 4 bytes for len_body placeholder
     written += 4
@@ -750,14 +974,31 @@ def read_chunks(
     end = fp.tell() + size
     result: list[Chunk] = []
     pos = end - size
+    read = fp.read
+    unpack_header = _HEADER_STRUCT.unpack
+    type_names = _TYPE_NAMES
+    chunk_types = CHUNK_TYPES
+    resolvers = _CONTEXT_RESOLVERS
+    fast_readers = _FAST_READERS
     while pos < end:
-        chunk_type, len_body = read_header(fp)
-        cls = CHUNK_TYPES.get(chunk_type, Chunk)
+        header = read(8)
+        if len(header) < 8:
+            raise OSError(
+                f"Short read on chunk header: expected 8 bytes, got {len(header)}"
+            )
+        raw_type, len_body = unpack_header(header)
+        chunk_type = type_names.get(raw_type) or _type_name(raw_type)
+        cls = chunk_types.get(chunk_type, Chunk)
 
-        resolver = _CONTEXT_RESOLVERS.get(chunk_type)
-        if cls._nests:
+        resolver = resolvers.get(chunk_type)
+        fast = fast_readers.get(cls, _UNSET)
+        if fast is _UNSET:
+            fast = _fast_reader(cls)
+        if fast is not None and resolver is None:
+            chunk: Chunk = fast(read, len_body, chunk_type)
+        elif cls._nests:
             # No resolver targets a nesting chunk (tests/unit/test_binary_io.py).
-            chunk: Chunk = cls.read(
+            chunk = cls.read(
                 fp,
                 len_body,
                 chunk_type=chunk_type,
@@ -775,7 +1016,8 @@ def read_chunks(
         result.append(chunk)
 
         # Consume pad byte if len_body is odd
-        read_pad(fp, len_body)
+        if len_body & 1:
+            read(1)
         pos += 8 + len_body + (len_body & 1)
 
     if pos != end:
@@ -795,6 +1037,10 @@ def read_aep(
     defer_list_types: frozenset[str] | None = None,
 ) -> tuple[ListChunk, str]:
     """Read an AEP file: RIFX root chunk + trailing XMP packet."""
+    # One read into memory: the chunk reader makes several small reads per
+    # chunk, which a buffered file object serves far slower than BytesIO.
+    if not isinstance(fp, BytesIO):
+        fp = BytesIO(fp.read())
     raw_type = read_bytes(fp, 4)
     chunk_type = raw_type.decode("ASCII")
     if chunk_type != "RIFX":

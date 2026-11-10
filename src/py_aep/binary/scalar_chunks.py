@@ -43,8 +43,8 @@ class _StringChunkBase(Chunk):
         raw = read_bytes(fp, size)
         return cls(chunk_type=chunk_type, value=raw.decode(cls._ENCODING))
 
-    def write(self, fp: IO[bytes]) -> int:
-        return write_bytes(fp, self.value.encode(self._ENCODING))
+    def _encode_body(self) -> bytes:
+        return self.value.encode(self._ENCODING)
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ use this to handle all fixed-layout chunks with zero per-class I/O code.
 from __future__ import annotations
 
 import struct
+import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING, cast
 
@@ -351,7 +352,11 @@ def _init_name(name: str) -> str:
     attrs strips the leading underscore from private field names for
     the `__init__` signature: `_trailing` -> `trailing=`.
     """
-    return name.lstrip("_") if name.startswith("_") else name
+    # Interned: the names are passed as `**kwargs` on every chunk read, and
+    # CPython matches a keyword to a parameter by identity before falling
+    # back to comparing it with every parameter name in turn - which made a
+    # 40-field `tdb4` five times slower to build.
+    return sys.intern(name.lstrip("_") if name.startswith("_") else name)
 
 
 def _decode_fields(

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from attrs import Factory, define
 
-from .bin_utils import read_bytes, write_bytes
+from .bin_utils import read_bytes
 from .bitfield import BitField
 from .chunk import Chunk, ContainerChunk
 from .fmt_field import (
@@ -370,17 +370,12 @@ class CdatChunk(Chunk):
         pad = read_bytes(fp, rest) if rest > 0 else b""
         return cls(chunk_type=chunk_type, values=vals, is_le=is_le, pad=pad)
 
-    def write(self, fp: IO[bytes]) -> int:
-        written = 0
-        if self.values:
-            count = len(self.values)
-            fmt = "<" if self.is_le else ">"
-            fmt += f"{count}d"
-            raw = struct.pack(fmt, *self.values)
-            written += write_bytes(fp, raw)
-        if self.pad:
-            written += write_bytes(fp, self.pad)
-        return written
+    def _encode_body(self) -> bytes:
+        values = self.values
+        if not values:
+            return self.pad
+        fmt = f"<{len(values)}d" if self.is_le else f">{len(values)}d"
+        return struct.pack(fmt, *values) + self.pad
 
 
 # ---------------------------------------------------------------------------
@@ -442,17 +437,14 @@ class TdumChunk(Chunk):
             object.__setattr__(instance, "_trailing", trailing)
         return instance
 
-    def write(self, fp: IO[bytes]) -> int:
+    def _encode_body(self) -> bytes:
         if self.is_color:
             raw = struct.pack(">4f", *self.values)
         elif self.is_integer:
             raw = struct.pack(">I", int(self.values[0]))
         else:
             raw = struct.pack(f">{len(self.values)}d", *self.values)
-        written = write_bytes(fp, raw)
-        if self._trailing:
-            written += write_bytes(fp, self._trailing)
-        return written
+        return raw + self._trailing
 
 
 # ---------------------------------------------------------------------------
@@ -486,12 +478,8 @@ class OtdaChunk(Chunk):
             object.__setattr__(instance, "_trailing", trailing)
         return instance
 
-    def write(self, fp: IO[bytes]) -> int:
-        raw = struct.pack(f">{len(self.values)}d", *self.values)
-        written = write_bytes(fp, raw)
-        if self._trailing:
-            written += write_bytes(fp, self._trailing)
-        return written
+    def _encode_body(self) -> bytes:
+        return struct.pack(f">{len(self.values)}d", *self.values) + self._trailing
 
 
 # ---------------------------------------------------------------------------
@@ -516,10 +504,8 @@ class TdmnChunk(_StringChunkBase):
         value = sys.intern(raw.rstrip(b"\x00").decode("UTF-8"))
         return cls(chunk_type=chunk_type, value=value)
 
-    def write(self, fp: IO[bytes]) -> int:
-        encoded = self.value.encode("UTF-8")[:40]
-        padded = encoded.ljust(40, b"\x00")
-        return write_bytes(fp, padded)
+    def _encode_body(self) -> bytes:
+        return self.value.encode("UTF-8")[:40].ljust(40, b"\x00")
 
 
 # Sentinel AE writes as the tdsn display name for unnamed properties;

@@ -360,6 +360,7 @@ def parse(
         print(app.version)
         ```
     """
+    from ._gc import gc_paused
     from .binary.chunk import read_aep
     from .parsers.application import parse_app
     from .parsers.project import parse_project
@@ -370,12 +371,13 @@ def parse(
         validate_platform(platform)
     file_path = os.fspath(aep_file_path)
     prefs_path = Path(ae_preferences_dir) if ae_preferences_dir else None
-    with open(file_path, "rb") as f:
-        rifx, xmp = read_aep(f, defer_list_types=_DEFERRED_LIST_TYPES)
-    project = parse_project(rifx, xmp, file_path, ae_preferences_dir=prefs_path)
-    if platform is not None:
-        project._platform = platform
-    return parse_app(rifx, project)
+    with gc_paused():
+        with open(file_path, "rb") as f:
+            rifx, xmp = read_aep(f, defer_list_types=_DEFERRED_LIST_TYPES)
+        project = parse_project(rifx, xmp, file_path, ae_preferences_dir=prefs_path)
+        if platform is not None:
+            project._platform = platform
+        return parse_app(rifx, project)
 
 
 # Default target version: the AE build the empty-project skeleton was
